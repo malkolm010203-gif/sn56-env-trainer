@@ -29,6 +29,7 @@ def alfworld_rollout(prompts: list[str], trainer, max_turns: int = 30) -> dict[s
     tokenizer = trainer.processing_class
     DATA_LEN = 2500
     TIMEOUT = 2400
+    GAMMA = 0.97
 
     conversation_start = [
         {"from": "human", "value": 'Interact with a household to solve a task. Imagine you are an intelligent agent in a household environment and your target is to perform actions to complete the task goal. At the beginning of your interactions, you will be given the detailed description of the current environment and your goal to accomplish. For each of your turn, you will be given a list of actions which you can choose one to perform in this turn. You should choose from two actions: "THOUGHT" or "ACTION". If you choose "THOUGHT", you should first think about the current condition and plan for your future actions, and then output your action in this turn. Your output must strictly follow this format:"Thought:\nyour thoughts.\n\nAction:\nyour next action"; If you choose "ACTION", you should directly output the action in this turn. Your output must strictly follow this format:"Action:\nyour next action". After your each turn, the environment will give you immediate feedback based on which you plan your next few steps. if the envrionment output "Nothing happened", that means the previous action is invalid and you should try more options.\n Reminder: \n1. the action must be chosen from the given available actions. Any actions except provided available actions will be regarded as illegal. \n2. Think when necessary, try to act directly more in the process.'},
@@ -38,11 +39,7 @@ def alfworld_rollout(prompts: list[str], trainer, max_turns: int = 30) -> dict[s
     game_id = random.randint(0, DATA_LEN - 1)
 
     for i, prompt in enumerate(prompts):
-        first_prompt_ids = []
-        first_completion_ids = []
-        first_logprobs = []
-        invalid_count = 0
-        valid_count = 0
+        turn_data = []
         done = False
         solved = False
         turn = 0
@@ -71,11 +68,7 @@ def alfworld_rollout(prompts: list[str], trainer, max_turns: int = 30) -> dict[s
             lp = out.get("logprobs", [])
             txt = tokenizer.decode(c_ids, skip_special_tokens=True).strip()
 
-            if turn == 0:
-                first_prompt_ids = p_ids
-                first_completion_ids = c_ids
-                first_logprobs = lp
-
+            step_valid = True
             messages.append({"role": "assistant", "content": txt})
 
             action = txt
@@ -83,6 +76,7 @@ def alfworld_rollout(prompts: list[str], trainer, max_turns: int = 30) -> dict[s
                 action = action[:-5]
             if "Action:" in action:
                 action = action.split("Action:")[-1].strip()
+            action = action.split("\n")[0].strip()
 
             try:
                 step_res = requests.post(f"{env_endpoint}/step", json={"id": env_id, "action": action}, timeout=TIMEOUT)
@@ -93,34 +87,37 @@ def alfworld_rollout(prompts: list[str], trainer, max_turns: int = 30) -> dict[s
                 done = step_data["done"]
                 actions = step_data["available_actions"]
                 fmt_obs = f"{state}\nAVAILABLE ACTIONS: {','.join(actions)}"
+                if "Nothing happens" in state:
+                    step_valid = False
             except:
                 fmt_obs = "Invalid Action.\n\n" + fmt_obs
                 done = False
                 state = "Invalid"
-                reward = 0.0
+                step_valid = False
 
             if done and reward > 0:
                 solved = True
 
-            if "Nothing happens" in state or "Invalid" in state:
-                invalid_count += 1
-            else:
-                valid_count += 1
+            turn_data.append((p_ids, c_ids, lp, step_valid))
 
             if not done:
                 messages.append({"role": "user", "content": fmt_obs})
             turn += 1
 
-        r = 1.0 if solved else 0.0
-        r += 0.15 * (1.0 - turn / max_turns) if solved else 0.0
-        r += 0.02 * valid_count if not solved else 0.0
-        r -= 0.03 * invalid_count
-        r = max(-0.5, min(1.5, r))
+        num_turns = len(turn_data)
+        base_reward = 1.0 if solved else 0.0
+        efficiency_bonus = 0.2 * (1.0 - num_turns / max_turns) if solved else 0.0
 
-        all_prompt_ids.append(first_prompt_ids)
-        all_completion_ids.append(first_completion_ids)
-        all_logprobs.append(first_logprobs)
-        all_rewards.append(r)
+        for t, (p_ids, c_ids, lp, step_valid) in enumerate(turn_data):
+            discount = GAMMA ** (num_turns - t - 1)
+            turn_reward = (base_reward + efficiency_bonus) * discount
+            turn_reward += 0.05 if step_valid else -0.05
+            turn_reward = max(-0.5, min(1.5, turn_reward))
+
+            all_prompt_ids.append(p_ids)
+            all_completion_ids.append(c_ids)
+            all_logprobs.append(lp)
+            all_rewards.append(turn_reward)
 
     return {
         "prompt_ids": all_prompt_ids,
