@@ -1,30 +1,30 @@
-def alfworld_rollout_full_episode(prompts: list[str], trainer, max_turns: int = 30) -> dict[str, list]:
+def alfworld_rollout(prompts: list[str], trainer, max_turns: int = 30) -> dict[str, list]:
     from trl.experimental.openenv import generate_rollout_completions
     import os
     import random
     import requests
 
-    if not getattr(alfworld_rollout_full_episode, "initialized", False):
+    if not getattr(alfworld_rollout, "initialized", False):
         rank = int(os.environ.get("LOCAL_RANK", "0"))
         raw_urls = os.environ.get("ENVIRONMENT_SERVER_URLS", "")
         server_list = [url.strip() for url in raw_urls.split(",") if url.strip()]
         base_url = server_list[rank % len(server_list)] if server_list else ""
-        alfworld_rollout_full_episode.base_url = base_url
+        alfworld_rollout.base_url = base_url
         try:
             create_res = requests.post(f"{base_url}/create", timeout=300)
             create_res.raise_for_status()
-            alfworld_rollout_full_episode.env_id = create_res.json()["id"]
-            alfworld_rollout_full_episode.initialized = True
+            alfworld_rollout.env_id = create_res.json()["id"]
+            alfworld_rollout.initialized = True
         except Exception as e:
             raise e
 
-    env_id = alfworld_rollout_full_episode.env_id
-    env_endpoint = alfworld_rollout_full_episode.base_url
+    env_id = alfworld_rollout.env_id
+    env_endpoint = alfworld_rollout.base_url
 
-    all_episode_prompt_ids = []
-    all_episode_completion_ids = []
-    all_episode_logprobs = []
-    all_episode_rewards = []
+    all_prompt_ids = []
+    all_completion_ids = []
+    all_logprobs = []
+    all_rewards = []
 
     tokenizer = trainer.processing_class
     DATA_LEN = 2500
@@ -38,11 +38,11 @@ def alfworld_rollout_full_episode(prompts: list[str], trainer, max_turns: int = 
     game_id = random.randint(0, DATA_LEN - 1)
 
     for i, prompt in enumerate(prompts):
-        ep_prompt_ids = []
-        ep_completion_ids = []
-        ep_logprobs = []
-        inv_cnt = 0
-        val_cnt = 0
+        first_prompt_ids = []
+        first_completion_ids = []
+        first_logprobs = []
+        invalid_count = 0
+        valid_count = 0
         done = False
         solved = False
         turn = 0
@@ -71,9 +71,10 @@ def alfworld_rollout_full_episode(prompts: list[str], trainer, max_turns: int = 
             lp = out.get("logprobs", [])
             txt = tokenizer.decode(c_ids, skip_special_tokens=True).strip()
 
-            ep_prompt_ids.extend(p_ids)
-            ep_completion_ids.extend(c_ids)
-            ep_logprobs.extend(lp)
+            if turn == 0:
+                first_prompt_ids = p_ids
+                first_completion_ids = c_ids
+                first_logprobs = lp
 
             messages.append({"role": "assistant", "content": txt})
 
@@ -94,36 +95,38 @@ def alfworld_rollout_full_episode(prompts: list[str], trainer, max_turns: int = 
                 fmt_obs = f"{state}\nAVAILABLE ACTIONS: {','.join(actions)}"
             except:
                 fmt_obs = "Invalid Action.\n\n" + fmt_obs
-                reward = 0.0
                 done = False
                 state = "Invalid"
+                reward = 0.0
 
             if done and reward > 0:
                 solved = True
+
             if "Nothing happens" in state or "Invalid" in state:
-                inv_cnt += 1
+                invalid_count += 1
             else:
-                val_cnt += 1
+                valid_count += 1
 
             if not done:
                 messages.append({"role": "user", "content": fmt_obs})
             turn += 1
 
         r = 1.0 if solved else 0.0
-        r += 0.02 * val_cnt if not solved else 0.0
-        r -= 0.02 * inv_cnt
-        r += 0.1 * (1.0 - turn / max_turns) if solved else 0.0
+        r += 0.15 * (1.0 - turn / max_turns) if solved else 0.0
+        r += 0.02 * valid_count if not solved else 0.0
+        r -= 0.03 * invalid_count
+        r = max(-0.5, min(1.5, r))
 
-        all_episode_prompt_ids.append(ep_prompt_ids)
-        all_episode_completion_ids.append(ep_completion_ids)
-        all_episode_logprobs.append(ep_logprobs)
-        all_episode_rewards.append(r)
+        all_prompt_ids.append(first_prompt_ids)
+        all_completion_ids.append(first_completion_ids)
+        all_logprobs.append(first_logprobs)
+        all_rewards.append(r)
 
     return {
-        "prompt_ids": all_episode_prompt_ids,
-        "completion_ids": all_episode_completion_ids,
-        "logprobs": all_episode_logprobs,
-        "env_rewards": all_episode_rewards
+        "prompt_ids": all_prompt_ids,
+        "completion_ids": all_completion_ids,
+        "logprobs": all_logprobs,
+        "env_rewards": all_rewards
     }
 
 
