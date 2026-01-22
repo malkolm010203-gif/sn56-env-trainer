@@ -29,7 +29,7 @@ def alfworld_rollout(prompts: list[str], trainer, max_turns: int = 30) -> dict[s
     tokenizer = trainer.processing_class
     DATA_LEN = 2500
     TIMEOUT = 2400
-    GAMMA = 0.97
+    GAMMA = 0.95
 
     conversation_start = [
         {"from": "human", "value": 'Interact with a household to solve a task. Imagine you are an intelligent agent in a household environment and your target is to perform actions to complete the task goal. At the beginning of your interactions, you will be given the detailed description of the current environment and your goal to accomplish. For each of your turn, you will be given a list of actions which you can choose one to perform in this turn. You should choose from two actions: "THOUGHT" or "ACTION". If you choose "THOUGHT", you should first think about the current condition and plan for your future actions, and then output your action in this turn. Your output must strictly follow this format:"Thought:\nyour thoughts.\n\nAction:\nyour next action"; If you choose "ACTION", you should directly output the action in this turn. Your output must strictly follow this format:"Action:\nyour next action". After your each turn, the environment will give you immediate feedback based on which you plan your next few steps. if the envrionment output "Nothing happened", that means the previous action is invalid and you should try more options.\n Reminder: \n1. the action must be chosen from the given available actions. Any actions except provided available actions will be regarded as illegal. \n2. Think when necessary, try to act directly more in the process.'},
@@ -40,6 +40,8 @@ def alfworld_rollout(prompts: list[str], trainer, max_turns: int = 30) -> dict[s
 
     for i, prompt in enumerate(prompts):
         turn_data = []
+        recent_actions = []
+        has_object = False
         done = False
         solved = False
         turn = 0
@@ -69,6 +71,7 @@ def alfworld_rollout(prompts: list[str], trainer, max_turns: int = 30) -> dict[s
             txt = tokenizer.decode(c_ids, skip_special_tokens=True).strip()
 
             step_valid = True
+            is_repeat = False
             messages.append({"role": "assistant", "content": txt})
 
             action = txt
@@ -77,6 +80,10 @@ def alfworld_rollout(prompts: list[str], trainer, max_turns: int = 30) -> dict[s
             if "Action:" in action:
                 action = action.split("Action:")[-1].strip()
             action = action.split("\n")[0].strip()
+
+            if action in recent_actions[-3:]:
+                is_repeat = True
+            recent_actions.append(action)
 
             try:
                 step_res = requests.post(f"{env_endpoint}/step", json={"id": env_id, "action": action}, timeout=TIMEOUT)
@@ -89,6 +96,10 @@ def alfworld_rollout(prompts: list[str], trainer, max_turns: int = 30) -> dict[s
                 fmt_obs = f"{state}\nAVAILABLE ACTIONS: {','.join(actions)}"
                 if "Nothing happens" in state:
                     step_valid = False
+                if "take" in action.lower() and "You pick up" in state:
+                    has_object = True
+                if "put" in action.lower() and step_valid and has_object:
+                    has_object = False
             except:
                 fmt_obs = "Invalid Action.\n\n" + fmt_obs
                 done = False
@@ -98,7 +109,7 @@ def alfworld_rollout(prompts: list[str], trainer, max_turns: int = 30) -> dict[s
             if done and reward > 0:
                 solved = True
 
-            turn_data.append((p_ids, c_ids, lp, step_valid))
+            turn_data.append((p_ids, c_ids, lp, step_valid, is_repeat, has_object))
 
             if not done:
                 messages.append({"role": "user", "content": fmt_obs})
@@ -108,10 +119,12 @@ def alfworld_rollout(prompts: list[str], trainer, max_turns: int = 30) -> dict[s
         base_reward = 1.0 if solved else 0.0
         efficiency_bonus = 0.2 * (1.0 - num_turns / max_turns) if solved else 0.0
 
-        for t, (p_ids, c_ids, lp, step_valid) in enumerate(turn_data):
+        for t, (p_ids, c_ids, lp, step_valid, is_repeat, holding) in enumerate(turn_data):
             discount = GAMMA ** (num_turns - t - 1)
             turn_reward = (base_reward + efficiency_bonus) * discount
-            turn_reward += 0.05 if step_valid else -0.05
+            turn_reward += 0.05 if step_valid else -0.08
+            turn_reward -= 0.03 if is_repeat else 0.0
+            turn_reward += 0.02 if holding and not solved else 0.0
             turn_reward = max(-0.5, min(1.5, turn_reward))
 
             all_prompt_ids.append(p_ids)
